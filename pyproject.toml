@@ -4,6 +4,44 @@ version = "0.37.0"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.11.8",
+    "alembic>=1.20.0",
+    "av>=17.0.0",
+    "blake3>=1.0.9",
+    "comfy-aimdo==0.5.5",
+    "comfy-angle>=0.1.1",
+    "comfy-kitchen==0.2.35",
+    "comfyui-embedded-docs==0.5.12",
+    "comfyui-frontend-package==1.53.6",
+    "comfyui-workflow-templates==0.11.69",
+    "einops>=0.8.2",
+    "filelock>=4.0.3",
+    "gguf>=0.13.0",
+    "kornia>=0.7.1",
+    "numpy>=1.25.0",
+    "pillow>=12.3.0",
+    "protobuf>=7.36.2",
+    "psutil>=7.2.2",
+    "pydantic~=2.0",
+    "pydantic-settings~=2.0",
+    "pyopengl>=3.1.8",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "safetensors>=0.4.2",
+    "scipy>=1.15.3",
+    "sentencepiece>=0.2.2",
+    "simpleeval>=1.0.0",
+    "spandrel>=0.4.2",
+    "sqlalchemy>=2.0.0",
+    "tokenizers>=0.13.3",
+    "torch>=2.14.0",
+    "torchsde>=0.2.6",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.1",
+    "transformers>=4.50.3",
+    "yarl>=1.18.0",
+]
 
 [project.urls]
 homepage = "https://www.comfy.org/"

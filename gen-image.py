@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""gen-image.py — 用同目录的 workflow.json 无头出图（不起 web 服务、不开浏览器）。
+"""gen-image.py — 用仓库里的 workflow json 无头出图（不起 web 服务、不开浏览器）。
 
     ./gen-image.py "a cozy cat sleeping on a windowsill, cinematic lighting"
     ./gen-image.py "a cozy cat" --batch-count 3
+
+默认用同目录的 txt-2-img.json（文生图）。换成图生图 workflow 时，prompt 后面可以依次跟
+参考图路径，几个槽就收几张，没给的槽空着（对应节点被旁路）：
+
+    ./gen-image.py --workflow txt-imgs-2-img.json "把背景换成夜晚的街道" 照片.png
+    ./gen-image.py --workflow @txt-imgs-2-img.json "按提示词融合这些图" a.png b.png c.png
+
+参考图会被拷进 ComfyUI 的 input/ 目录才喂给 LoadImage —— 它只认那里，且按 realpath 判定，
+软链会被拒。副本放在 input/gen-image/ 下、按内容 sha1 命名，同一张图不会重复拷。
 
 直接在本进程里跑 ComfyUI 的执行器（PromptExecutor），不碰 HTTP/WebSocket。图片落在
 ComfyUI 的 output/ 目录；每张图一个 seed（默认随机，也可用 --seed 固定），并把 seed
@@ -10,11 +19,11 @@ ComfyUI 的 output/ 目录；每张图一个 seed（默认随机，也可用 --s
 
     output/<filename_prefix>_seed3827194655_00001_.png
 
-PNG 里会嵌入一份同步过 prompt / seed / 文件名前缀的 workflow，拖回 ComfyUI 网页版
-直接 Queue 就能复现同一张图。
+PNG 里会嵌入一份同步过 prompt / 参考图 / seed / 文件名前缀的 workflow，拖回 ComfyUI
+网页版直接 Queue 就能复现同一张图。
 
-workflow.json 在网页版里调好后用 Workflow → Export 导出覆盖（网页版的 Ctrl+S 存的
-是 user/default/workflows/，不是这个文件）。
+workflow json 在网页版里调好后用 Workflow → Export 导出覆盖（网页版的 Ctrl+S 存的
+是 user/default/workflows/，不是这里这份）。
 """
 
 # comfy 相关的 import 一律留在函数内部，这不是疏漏：comfy/cli_args.py 在 import 期就
@@ -27,18 +36,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import random
+import re
+import shutil
 import signal
 import sys
 import uuid
 from collections import deque
 from copy import deepcopy
+from typing import NamedTuple
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-WORKFLOW_PATH = os.path.join(SCRIPT_DIR, "workflow.json")
+DEFAULT_WORKFLOW_NAME = "txt-2-img.json"
 if os.name == "nt":
     VENV_PYTHON = os.path.join(SCRIPT_DIR, ".venv", "Scripts", "python.exe")
 else:
@@ -51,10 +64,18 @@ PREFERRED_PROMPT_NAMES = ("prompt", "text")
 SEED_INPUT_NAMES = ("seed", "noise_seed")
 # 前端 LGraphEventMode：2 = NEVER（静音），4 = BYPASS（旁路）
 SKIPPED_NODE_MODES = (2, 4)
+BYPASS_NODE_MODE = 4
+# autogrow 在 v1 信息里是一个整体条目，前端却把它展开出来的每个子槽单独序列化成一条连线
+AUTOGROW_IO_TYPE = "COMFY_AUTOGROW_V3"
+# 条件节点上的参考图槽：QwenImage21 的 autogrow 是 image_1/image_2/…（API prompt 里带
+# images. 前缀），QwenImageEditPlus 是 image1/image2/image3
+IMAGE_SLOT_PATTERN = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*\.)?image(?:_?(\d+))?$")
+# 参考图副本放 input/ 的子目录里，免得把 LoadImage 的下拉列表刷爆
+STAGED_SUBDIR = "gen-image"
 
 
 class ConversionError(Exception):
-    """workflow.json 里出现了转换器无法处理的东西。"""
+    """workflow json 里出现了转换器无法处理的东西。"""
 
 
 def reexec_in_venv() -> None:
@@ -70,10 +91,21 @@ def reexec_in_venv() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gen-image.py",
-        description="用同目录的 workflow.json 无头出图（不起 web 服务、不开浏览器）",
+        description="用仓库里的 workflow json 无头出图（不起 web 服务、不开浏览器）",
         epilog="未识别的参数会原样交给 ComfyUI 自己的参数解析（例如 --cpu、--verbose DEBUG）。",
     )
     parser.add_argument("prompt", help="正向提示词，注入 workflow 里的文本编码节点")
+    parser.add_argument(
+        "img_paths", nargs="*", metavar="img-path",
+        help="参考图路径，依次进 workflow 的 image_1/image_2/… 槽，数量不能多于槽数；"
+             "只有 workflow 里真有参考图槽时才接受（图生图 workflow）。空串按没给处理，"
+             "没给的槽在 workflow 里会被旁路",
+    )
+    parser.add_argument(
+        "-w", "--workflow", default=DEFAULT_WORKFLOW_NAME, metavar="PATH",
+        help=f"用哪份 workflow json（默认 {DEFAULT_WORKFLOW_NAME}）。可以写 @xxx.json；"
+             "相对路径先按当前目录找，再按脚本所在目录找",
+    )
     parser.add_argument(
         "-n", "--batch-count", type=int, default=1, metavar="N",
         help="连续生成 N 张（默认 1），每张一个随机 seed",
@@ -85,9 +117,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dump-prompt", action="store_true",
         help="只打印转换结果（prompt + 同步后的 workflow）不跑模型，"
-             "也不施加随机 seed / 文件名前缀改写，便于和已有 PNG 做回归比对",
+             "也不施加随机 seed / 文件名前缀改写，便于和已有 PNG 做回归比对"
+             "（注意：参考图仍会被拷进 input/，因为 LoadImage 只认那里）",
     )
     return parser
+
+
+def resolve_workflow_path(value: str) -> str:
+    """--workflow 的值 -> 实际文件路径。
+
+    允许前导 @（顺手写法），支持 ~。相对路径先按当前目录找，再按脚本目录找 —— 这样在别的
+    目录下跑也能用仓库里的 workflow，找不到时返回脚本目录那份，让调用方报错报出完整路径。
+    """
+    name = os.path.expanduser(value.strip())
+    if name.startswith("@"):
+        name = name[1:]
+    if os.path.isabs(name):
+        return name
+    for base in (os.getcwd(), SCRIPT_DIR):
+        candidate = os.path.join(base, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(SCRIPT_DIR, name)
 
 
 def parse_cli(argv: list[str]) -> argparse.Namespace:
@@ -119,6 +170,10 @@ def bootstrap():
 
     if args.output_directory:
         folder_paths.set_output_directory(os.path.abspath(args.output_directory))
+    if args.input_directory:
+        # 参考图要拷进 input 目录，所以这个也必须跟 main.py 一样生效，否则图片会拷到
+        # 默认目录、而 LoadImage 校验的是另一个地方
+        folder_paths.set_input_directory(os.path.abspath(args.input_directory))
 
     return argparse.Namespace(
         args=args,
@@ -249,6 +304,26 @@ def is_widget_input(io_type, options: dict) -> bool:
     return io_type in WIDGET_TYPES
 
 
+def find_autogrow_parent(info: dict, input_order: dict, child_name: str):
+    """「不在 input_order 里的槽名」属于哪个 autogrow 输入？认不出返回 None。
+
+    v1 信息里 autogrow 是一个整体条目（比如 TextEncodeQwenImage21 的 images），模板自带
+    子槽名单（TemplateNames 的 names，或 TemplatePrefix 的 prefix+max），拿它对上就行。
+    """
+    for category in ("required", "optional"):
+        for parent in input_order.get(category) or []:
+            io_type, options = split_input_entry((info["input"].get(category) or {}).get(parent))
+            if io_type != AUTOGROW_IO_TYPE:
+                continue
+            template = options.get("template") or {}
+            names = template.get("names")
+            if names is None and template.get("prefix") is not None:
+                names = [f"{template['prefix']}{index}" for index in range(template.get("max") or 0)]
+            if names and child_name in names:
+                return parent
+    return None
+
+
 def convert(ctx, workflow: dict):
     """UI workflow -> (API prompt, widget_map, warnings)。
 
@@ -323,7 +398,11 @@ def convert(ctx, workflow: dict):
                 continue
             origin = links.get(socket["link"])
             if origin is not None:
-                inputs[name] = [str(origin[0]), origin[1]]
+                # autogrow 的子槽在 API prompt 里得写成点号路径（images.image_1）：执行器靠
+                # dynamic_paths 把它们收进 images 字典，写成裸名字会让 execute 收到 image_1
+                # 这个意料外的关键字参数直接报错
+                parent = find_autogrow_parent(info, input_order, name)
+                inputs[f"{parent}.{name}" if parent else name] = [str(origin[0]), origin[1]]
 
         if widget_index != len(widgets_values):
             warnings.append(
@@ -448,6 +527,103 @@ def describe_candidates(prompt: dict, candidates) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 参考图槽（图生图）
+# ---------------------------------------------------------------------------
+
+class ImageSlot(NamedTuple):
+    """一个参考图槽。
+
+    api_key 是写进 API prompt 的名字（autogrow 子槽是点号路径 images.image_1），ui_name 是
+    UI workflow 里的槽名（前端看到的 image_1），node_id 是喂它的 LoadImage 节点。
+    """
+
+    api_key: str
+    ui_name: str
+    node_id: str
+
+
+def find_image_slots(prompt: dict, widget_map: dict, conditioning_id: str) -> list[ImageSlot]:
+    """条件节点上的参考图槽，按槽名里的序号排好 —— 正好对上命令行的 <img-path1> <img-path2> …。
+
+    槽名两种都认：QwenImage21 的 autogrow 展开成 image_1/image_2/…（API 里带 images. 前缀），
+    QwenImageEditPlus 是 image1/image2/image3。
+
+    判定是不是图槽看两点：槽名匹配且是连线，且源头节点有个 image 控件（LoadImage 就是只有
+    一个字符串控件的那种），免得把别的带 image 名字的连线当参考图。
+    """
+    found = []
+    for name, value in (prompt[conditioning_id]["inputs"] or {}).items():
+        match = IMAGE_SLOT_PATTERN.match(name)
+        if match is None or not is_link(value):
+            continue
+        origin_id = str(value[0])
+        if origin_id not in prompt or "image" not in (widget_map.get(origin_id) or {}):
+            continue
+        found.append((int(match.group(1) or 1),
+                      ImageSlot(name, name.rsplit(".", 1)[-1], origin_id)))
+    found.sort(key=lambda item: item[0])
+    return [slot for _, slot in found]
+
+
+def stage_image(ctx, source_path: str) -> str:
+    """把参考图拷进 input/ 并返回写进 LoadImage.image 的相对路径。
+
+    LoadImage 只认 input 目录：load_image 走 folder_paths.get_annotated_filepath，里面的
+    is_within_directory 用 realpath 判定，所以软链过不了，只能实体拷贝。副本按内容 sha1
+    命名（顺带天然去重），已经拷过就跳过。
+    """
+    source = os.path.abspath(os.path.expanduser(source_path))
+    if not os.path.isfile(source):
+        raise ConversionError(f"参考图不存在或不是普通文件：{source}")
+
+    digest = hashlib.sha1()
+    with open(source, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    name = f"{digest.hexdigest()[:12]}{os.path.splitext(source)[1].lower()}"
+    target_dir = os.path.join(ctx.folder_paths.get_input_directory(), STAGED_SUBDIR)
+    target = os.path.join(target_dir, name)
+    if not os.path.isfile(target):
+        os.makedirs(target_dir, exist_ok=True)
+        # 用 copy 不用硬链：硬链会让 input 里的副本跟着原文件原地改写而变化，
+        # sha1 名字就不再代表内容了
+        shutil.copy2(source, target)
+    return f"{STAGED_SUBDIR}/{name}"
+
+
+def drop_image_slots(api_prompt: dict, ui_workflow: dict, conditioning_id: str,
+                     slots: list[ImageSlot], filled: set[int]) -> None:
+    """没传图的槽整个摘掉：API prompt 里删掉 LoadImage 节点和消费端对应的槽。
+
+    filled 是「拿到图了」的槽下标（位置对应：第 i 个图片参数进第 i 个槽，空串就是这一槽没给）。
+
+    只把槽名去掉、留着连线是不行的 —— 源节点没了就是悬空连线，execution.py 校验时会
+    直接报错。UI 副本里把那个节点标成 BYPASS、名字清空，这样嵌进 PNG 的 workflow 拖回
+    网页版看到的就是「旁路」，跟命令行里的「没传就空着」对得上。
+    """
+    dropped = [slot for index, slot in enumerate(slots) if index not in filled]
+    if not dropped:
+        return
+    dropped_ids = {slot.node_id for slot in dropped}
+    dropped_names = {slot.ui_name for slot in dropped}
+    for slot in dropped:
+        api_prompt[conditioning_id]["inputs"].pop(slot.api_key, None)
+        api_prompt.pop(slot.node_id, None)
+    for node in ui_workflow.get("nodes") or []:
+        node_id = str(node["id"])
+        if node_id in dropped_ids:
+            node["mode"] = BYPASS_NODE_MODE
+            values = node.get("widgets_values")
+            if isinstance(values, list) and values:
+                values[0] = ""
+        elif node_id == conditioning_id:
+            for socket in node.get("inputs") or []:
+                if socket.get("name") in dropped_names:
+                    socket["link"] = None
+
+
+# ---------------------------------------------------------------------------
 # 执行
 # ---------------------------------------------------------------------------
 
@@ -529,13 +705,14 @@ def main() -> int:
     cli = parse_cli(sys.argv[1:])
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
 
-    if not os.path.isfile(WORKFLOW_PATH):
+    workflow_path = resolve_workflow_path(cli.workflow)
+    if not os.path.isfile(workflow_path):
         logging.error(
             "找不到 workflow 文件：%s\n"
-            "请先在 ComfyUI 网页版里调好图，用 Workflow → Export 导出覆盖它。", WORKFLOW_PATH,
+            "请先在 ComfyUI 网页版里调好图，用 Workflow → Export 导出覆盖它。", workflow_path,
         )
         return 2
-    with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+    with open(workflow_path, encoding="utf-8") as handle:
         workflow = json.load(handle)
 
     ctx = bootstrap()
@@ -560,8 +737,9 @@ def main() -> int:
     if target is None:
         logging.error(
             "没定位到唯一的目标提示词输入（采样器 %s 的上游）：\n%s\n"
-            "请在网页版里把提示词节点整理清楚再导出，或在 workflow.json 里确认节点结构。",
+            "请在网页版里把提示词节点整理清楚再导出，或在 %s 里确认节点结构。",
             sampler_id, describe_candidates(api_prompt, ambiguous),
+            os.path.basename(workflow_path),
         )
         return 2
     _, prompt_node, prompt_input = target
@@ -572,6 +750,33 @@ def main() -> int:
     save_node, prefix_input = find_save_prefix_target(api_prompt, widget_map)
     if save_node is None:
         logging.warning("没找到带 filename_prefix 的存图节点，文件名不会带 seed")
+
+    # 参考图：这些值对所有 batch 都一样，所以一次写进主副本（--dump-prompt 也就跟着有图了）
+    slots = find_image_slots(api_prompt, widget_map, prompt_node)
+    if len(cli.img_paths) > len(slots):
+        if not slots:
+            logging.error(
+                "这份 workflow（%s）里没有参考图槽，prompt 后面不能跟图片路径。"
+                "图生图请用 --workflow txt-imgs-2-img.json。", os.path.basename(workflow_path),
+            )
+        else:
+            logging.error("这份 workflow（%s）只有 %d 个参考图槽，prompt 后面最多跟 %d 个图片路径",
+                          os.path.basename(workflow_path), len(slots), len(slots))
+        return 2
+    # 位置对应：第 i 个图片参数进第 i 个槽，空串就是这一槽不给
+    try:
+        staged = {index: stage_image(ctx, path)
+                  for index, path in enumerate(cli.img_paths) if path.strip()}
+    except ConversionError as exc:
+        logging.error("%s", exc)
+        return 2
+    for index, staged_name in sorted(staged.items()):
+        slot = slots[index]
+        set_input(api_prompt, workflow, widget_map, slot.node_id, "image", staged_name)
+        logging.info("参考图 -> 节点 %s 的 %s：%s", slot.node_id, slot.ui_name, staged_name)
+    if slots:
+        logging.info("参考图槽 %d 个，这次给了 %d 张，其余旁路", len(slots), len(staged))
+    drop_image_slots(api_prompt, workflow, prompt_node, slots, filled=set(staged))
 
     if cli.dump_prompt:
         ui_copy = deepcopy(workflow)
